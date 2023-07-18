@@ -16,14 +16,15 @@ Build-Depends: debhelper (>= 10.0), cmake, ninja-build,
     lcov, procps, help2man, zlib1g-dev,
     g++-multilib [amd64 i386 kfreebsd-amd64 mips64 mips64el mipsel powerpc ppc64 s390 s390x sparc sparc64 x32],
     libjs-mathjax, python3-recommonmark,
-    doxygen, gfortran,
+    doxygen,
     ocaml-base [amd64 arm64 armhf ppc64el riscv64 s390x] | ocaml-nox [amd64 arm64 armhf ppc64el riscv64 s390x],
     ocaml-findlib [amd64 arm64 armhf ppc64el riscv64 s390x],
     libctypes-ocaml-dev [amd64 arm64 armhf ppc64el riscv64 s390x],
     dh-exec, dh-ocaml [amd64 arm64 armhf ppc64el riscv64 s390x],
     libpfm4-dev [linux-any], python3-setuptools, libz3-dev,
-    llvm-spirv [ amd64 arm64 armel armhf mips64el mipsel ppc64el s390x ] <!stage1> | hello [!i386],
+    llvm-spirv-14 [ amd64 arm64 armel armhf mips64el mipsel ppc64el riscv64 s390x ] <!stage1> | hello [!i386],
     spirv-tools [ linux-any ] | hello [ !i386],
+    wasi-libc | hello [ !i386],
     libcurl4-dev,
     libgrpc++-dev [amd64 arm64 armel armhf mips64el mipsel ppc64 ppc64el powerpc riscv64 s390x],
     protobuf-compiler-grpc [amd64 arm64 armel armhf mips64el mipsel ppc64 ppc64el powerpc riscv64 s390x],
@@ -31,7 +32,7 @@ Build-Depends: debhelper (>= 10.0), cmake, ninja-build,
     protobuf-compiler [amd64 arm64 armel armhf mips64el mipsel ppc64 ppc64el powerpc riscv64 s390x]
 # "| hello" is for older buster/bionic distros without spirv support
 Build-Conflicts: oprofile
-Standards-Version: 4.2.1
+Standards-Version: 4.6.2
 Homepage: https://www.llvm.org/
 Vcs-Git: https://salsa.debian.org/pkg-llvm-team/llvm-toolchain.git -b 14
 Vcs-Browser: https://salsa.debian.org/pkg-llvm-team/llvm-toolchain/tree/14
@@ -41,13 +42,13 @@ Vcs-Browser: https://salsa.debian.org/pkg-llvm-team/llvm-toolchain/tree/14
 Package: clang-14
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${dep:devlibs},
- ${dep:devlibs-objc}, libclang-common-14-dev (= ${binary:Version}),
+ ${dep:devlibs-objc}, libclang-common-14-dev (= ${source:Version}),
  llvm-14-linker-tools (= ${binary:Version}),
  libclang1-14 (= ${binary:Version}), libc6-dev, binutils
 Provides: c-compiler, objc-compiler, c++-compiler
 Recommends: llvm-14-dev, python3
 # libomp-14-dev
-Suggests: clang-14-doc
+Suggests: clang-14-doc, wasi-libc
 Description: C, C++ and Objective-C compiler
  Clang project is a C, C++, Objective C and Objective C++ front-end
  based on the LLVM compiler. Its goal is to offer a replacement to the
@@ -100,7 +101,7 @@ Description: clang-based C++ linter tool
 Package: clangd-14
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends},
- libclang-common-14-dev (= ${binary:Version})
+ libclang-common-14-dev (= ${source:Version})
 Description: Language server that provides IDE-like features to editors
  clangd understands your C++ code and adds smart features to your editor:
   - code completion
@@ -151,7 +152,7 @@ Architecture: any
 Section: libdevel
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${dep:devlibs},
  ${dep:devlibs-objc}, libclang1-14 (= ${binary:Version}),
- libclang-common-14-dev (= ${binary:Version})
+ libclang-common-14-dev (= ${source:Version})
 Breaks: llvm-14-dev (<< 1:14.0.4-2)
 Replaces: llvm-14-dev (<< 1:14.0.4-2)
 Description: Clang library - Development package
@@ -166,9 +167,10 @@ Description: Clang library - Development package
  libclang1-14.
 
 Package: libclang-common-14-dev
-Architecture: any
+Architecture: all
 Section: libdevel
-Depends: ${shlibs:Depends}, ${misc:Depends}, libllvm14 (= ${binary:Version})
+Depends: ${shlibs:Depends}, ${misc:Depends}, libllvm14 (>= ${source:Version})
+Recommends: libclang-rt-14-dev (>= 1:14.0.6-10~exp4)
 Description: Clang library - Common development package
  Clang project is a C, C++, Objective C and Objective C++ front-end
  based on the LLVM compiler. Its goal is to offer a replacement to the
@@ -177,8 +179,64 @@ Description: Clang library - Common development package
  Clang implements all of the ISO C++ 1998, 11, 14 and 17 standards and also
  provides most of the support of C++20.
  .
- This package contains the Clang generic headers and some libraries
- (profiling, etc).
+ This package contains the Clang generic headers.
+
+# ------------- compiler-rt -------------
+
+Package: libclang-rt-14-dev
+Architecture: any
+Multi-Arch: same
+Section: libdevel
+Breaks: libclang-common-14-dev (<< 1:14.0.6-10~exp4)
+Replaces: libclang-common-14-dev (<< 1:14.0.6-10~exp4)
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Compiler-rt - development package
+ This package provides various libraries:
+ .
+   * builtins - Simple libraries that provide implementation of the
+     low-level target-specific hooks required by code generation
+     and other runtime components.
+   * sanitizer runtimes - AddressSanitizer, ThreadSanitizer,
+     UndefinedBehaviorSanitizer, MemorySanitizer, LeakSanitizer
+     DataFlowSanitizer, etc
+   * profile - Library which is used to collect coverage information.
+
+Package: libclang-rt-14-dev-wasm32
+Architecture: all
+Multi-Arch: foreign
+Section: libdevel
+Breaks: libclang-common-14-dev (<< 1:14.0.6-10~exp4)
+Replaces: libclang-common-14-dev (<< 1:14.0.6-10~exp4)
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: libclang-common-14-dev (>= 1:14.0.6-10~exp4)
+Description: Compiler-rt - wasm32 builtins
+ Provides the compiler-rt builtins for WebAssembly 32 bits
+
+Package: libclang-rt-14-dev-wasm64
+Architecture: all
+Multi-Arch: foreign
+Section: libdevel
+Breaks: libclang-common-14-dev (<< 1:14.0.6-10~exp4)
+Replaces: libclang-common-14-dev (<< 1:14.0.6-10~exp4)
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: libclang-common-14-dev (>= 1:14.0.6-10~exp4)
+Description: Compiler-rt - wasm64 builtins
+ Provides the compiler-rt builtins for WebAssembly 64 bits
+
+# ------------- polly -------------
+
+Package: libpolly-14-dev
+Architecture: any
+Multi-Arch: same
+Section: libdevel
+Breaks: libclang-rt-14-dev (<< 1:14.0.6-10~exp6), libclang-common-14-dev (<< 1:14.0.6-10~exp5)
+Replaces: libclang-rt-14-dev (<< 1:14.0.6-10~exp6), libclang-common-14-dev (<< 1:14.0.6-10~exp5)
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: High-level loop and data-locality optimizer
+ Uses an abstract mathematical representation based on integer polyhedra
+ to analyze and optimize the memory access pattern of a program
+
+# ------------- clang libraries -------------
 
 Package: libclang-cpp14
 Section: libs
@@ -648,6 +706,29 @@ Description: LLVM C++ Standard library (development files)
      as exception objects, rtti and memory allocation.
    * Extensive unit tests.
 
+Package: libc++-14-dev-wasm32
+Section: libdevel
+Architecture: all
+Multi-Arch: foreign
+Depends: wasi-libc, libc++abi-14-dev-wasm32, ${misc:Depends}
+Provides: libc++-x.y-dev-wasm32
+Conflicts: libc++-x.y-dev-wasm32
+Replaces: libc++-x.y-dev-wasm32
+Description: LLVM C++ Standard library (WASI)
+ libc++ is another implementation of the C++ standard library
+ .
+ Features and Goals
+ .
+   * Correctness as defined by the C++ standards.
+   * Fast execution.
+   * Minimal memory use.
+   * Fast compile times.
+   * ABI compatibility with gcc's libstdc++ for some low-level features such
+     as exception objects, rtti and memory allocation.
+   * Extensive unit tests.
+ .
+ This package provides a version for the 32-bit WebAssembly System Interface.
+
 # ------------- libcxxabi -------------
 
 Package: libc++abi1-14
@@ -686,6 +767,25 @@ Description: LLVM low level support for a standard C++ library (development file
  .
    * Correctness as defined by the C++ standards.
    * Provide a portable sublayer to ease the porting of libc++
+
+Package: libc++abi-14-dev-wasm32
+Section: libdevel
+Architecture: all
+Multi-Arch: foreign
+Depends: wasi-libc, ${misc:Depends}
+Provides: libc++abi-x.y-dev-wasm32
+Conflicts: libc++abi-x.y-dev-wasm32
+Replaces: libc++abi-x.y-dev-wasm32
+Description: LLVM low level support for a standard C++ library (WASI)
+ libc++abi is another implementation of low level support for a standard C++
+ library.
+ .
+ Features and Goals
+ .
+   * Correctness as defined by the C++ standards.
+   * Provide a portable sublayer to ease the porting of libc++
+ .
+ This package provides a version for the 32-bit WebAssembly System Interface.
 
 # ------------- libclc -------------
 
@@ -750,9 +850,8 @@ Multi-Arch: same
 Depends:
  ${misc:Depends},
  libunwind-14 (= ${binary:Version})
-Breaks: libunwind-dev
-Provides: libunwind-x.y-dev
-Conflicts: libunwind-x.y-dev
+Provides: libunwind-dev, libunwind-x.y-dev
+Conflicts: libunwind-dev, libunwind-x.y-dev
 Replaces: libunwind-dev, libunwind-x.y-dev
 Description: production-quality unwinder
  libunwind is a production-quality unwinder, with platform support for DWARF

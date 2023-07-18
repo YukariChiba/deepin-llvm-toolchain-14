@@ -20,6 +20,13 @@ ifeq ($(LLVM_VERSION),$(LLVM_VERSION_FULL))
 	LLVM_VERSION_FULL := $(LLVM_VERSION).0.0
 endif
 
+SOURCE_NAME := $(shell dpkg-parsechangelog -S Source)
+ifneq (,$(findstring snapshot,$(SOURCE_NAME)))
+  BRANCH_NAME=snapshot
+else
+  BRANCH_NAME=$(LLVM_VERSION)
+endif
+
 SONAME_EXT      := 1
 # clang soname has started with llvm-toolchain-13.
 # it is normal that 13 is what is seen in 14 or later version as
@@ -28,10 +35,11 @@ SONAME_CLANG      := 13
 SONAME_OPENMP	:= 5
 # Manage the case when the version is 3.5~svn213052-1~exp1 or 3.4.2-1
 DEBIAN_REVISION := $(shell dpkg-parsechangelog |  sed -rne "s,^Version: 1:([0-9.]+)(~|-)(.*),\3,p")
+TARGET_DISTRO := $(shell dpkg-parsechangelog -S Distribution)
 ifneq (,$(filter parallel=%,$(subst $(COMMA), ,$(DEB_BUILD_OPTIONS))))
   NJOBS := -j $(subst parallel=,,$(filter parallel=%,$(subst $(COMMA), ,$(DEB_BUILD_OPTIONS))))
 else
-  NJOBS := $(shell nproc)
+  NJOBS := -j $(shell nproc)
 endif
 
 VENDOR=$(shell lsb_release -is)
@@ -92,6 +100,12 @@ COMPILER_RT_USE_BUILTINS_LIBRARY := ON
 LIBCXX_EXCEPTIONS := ON
 LIBCXX_USE_COMPILER_RT := ON
 
+# We want to set the clang extra version ONLY in stage 2
+# because we want the clang stage 1 to be as reproducible as possible
+# when building with sccache (because this tool do a hash using the
+# compiler binary and other things)
+STAGE_2_CMAKE_EXTRA += -DCLANG_REPOSITORY_STRING=$(DEBIAN_REVISION)
+
 ifneq (,$(filter $(DEB_HOST_ARCH),sparc sparc64))
 STAGE_1_CMAKE_EXTRA += -DLLVM_PARALLEL_LINK_JOBS=4
 endif
@@ -101,11 +115,6 @@ ifneq (,$(filter $(DEB_HOST_ARCH),i386 hurd-i386 kfreebsd-i386 armel mipsel powe
 # itself. The atomic detection is failing on armel and riscv64. Forcing the inclusion
 # everywhere and in all stages
 LDFLAGS_EXTRA += -latomic
-endif
-
-ifeq ($(shell dpkg --compare-versions $(shell dpkg-query -W -f '$${Version}' g++-$(GCC_VERSION)) lt 4.9-20140411-1~ ; echo $$?),0)
-# Too old version of gcc. Force 4.9
-	GCC_VERSION := 4.9
 endif
 
 Z3_FLAG = -DLLVM_ENABLE_Z3_SOLVER=OFF
@@ -223,20 +232,30 @@ else
 	control_vars = '-Vdep:devlibs=libstdc++6-$(GCC_VERSION)-dev'
 endif
 
-ifeq ($(shell command -v llvm-spirv),)
-LLVM_SPIRV_INSTALLED = no
+LLVM_SPIRV := $(shell bash -c "command -v llvm-spirv llvm-spirv-$(LLVM_VERSION)" 2>/dev/null)
+
+ifndef LLVM_SPIRV
+	LLVM_SPIRV_INSTALLED = no
 else
-	ifeq ($(shell dpkg --compare-versions $(shell dpkg-query -W -f '$${Version}' llvm-spirv) gt 10.0.0 ; echo $$?),0)
-# Too old llvm-spirv version are failing. See #52200
-		LLVM_SPIRV_INSTALLED = yes
+	# if executable is llvm-spirv without a -$(LLVM_VERSION) suffix
+	ifeq ($(LLVM_SPIRV:-$(LLVM_VERSION)=),$(LLVM_SPIRV))
+		# Too old llvm-spirv version are failing. See #52200
+		ifeq ($(shell dpkg --compare-versions $(shell dpkg-query -W -f '$${Version}' llvm-spirv) gt 10.0.0 ; echo $$?),0)
+			LLVM_SPIRV_INSTALLED = yes
+		else
+			LLVM_SPIRV_INSTALLED = no
+		endif
 	else
-		LLVM_SPIRV_INSTALLED = no
+		# llvm-spirv renamed llvm-spirv-$(LLVM_VERSION) as of llvm-spirv-13
+		LLVM_SPIRV_INSTALLED = yes
 	endif
 endif
 
 LIBCLC_TARGETS_TO_BUILD="amdgcn--;amdgcn--amdhsa;amdgcn-mesa-mesa3d;r600--;nvptx--;nvptx64--;nvptx--nvidiacl;nvptx64--nvidiacl"
+LIBCLC_TARGETS_LLVM_SPIRV =
 ifeq ($(LLVM_SPIRV_INSTALLED),yes)
 	LIBCLC_TARGETS_TO_BUILD := $(LIBCLC_TARGETS_TO_BUILD)";spirv-mesa3d-;spirv64-mesa3d-"
+	LIBCLC_TARGETS_LLVM_SPIRV = "-DLLVM_SPIRV=$(LLVM_SPIRV)"
 endif
 
 BINUTILS_GOLD_ARCHS := amd64 arm64 armhf i386 ppc64 ppc64el x32 s390x hurd-i386 kfreebsd-amd64 kfreebsd-i386
@@ -355,6 +374,15 @@ else
 	PROJECTS+=;lldb
 endif
 
+LIBCXX_WASM_ENABLE=yes
+LIBCXX_WASM_DISABLE_DISTRO := bionic buster focal bullseye jammy
+# Either wasi-libc doesn't exist / too old
+# or we have this bug
+# https://sourceware.org/bugzilla/show_bug.cgi?id=27558
+ifeq (,$(filter-out $(LIBCXX_WASM_DISABLE_DISTRO), $(DISTRO)))
+  LIBCXX_WASM_ENABLE=no
+endif
+
 ifneq (,$(filter $(DISTRO),stretch))
 # Don't enable lld python for old distros
   STAGE_ALL_CMAKE_EXTRA += -DLLDB_ENABLE_PYTHON=OFF
@@ -414,6 +442,18 @@ ifeq ($(shell test -e /tmp/cmake/bin/cmake && echo -n yes),yes)
 	export LD_LIBRARY_PATH=$$LD_LIBRARY_PATH:/tmp/cmake/bin/
 endif
 
+SCCACHE_ENABLE=no
+SCCACHE_CMAKE =
+# if sccache is installed in the chroot, use it
+ifeq ($(shell test -e /opt/sccache/sccache && echo -n yes),yes)
+	STAGE_1_CMAKE_EXTRA += $(SCCACHE_CMAKE)
+	SCCACHE_ENABLE=yes
+	SCCACHE_PATH=/opt/sccache/
+	SCCACHE_CMD=$(SCCACHE_PATH)/sccache
+	SCCACHE_CMAKE = -DCMAKE_C_COMPILER_LAUNCHER=$(SCCACHE_CMD) -DCMAKE_CXX_COMPILER_LAUNCHER=$(SCCACHE_CMD)
+	export LD_LIBRARY_PATH=$$LD_LIBRARY_PATH:/opt/sccache
+endif
+
 GENERATOR=Ninja
 
 # enables cmake build targets like stage2-[target_name]
@@ -433,6 +473,16 @@ preconfigure:
 		exit 1; \
 	fi
 
+	# Add a check to avoid a mistake that I did many times
+	if test "$(TARGET_DISTRO)" = "unstable"; then \
+		if echo "$(DEBIAN_REVISION)"|grep -q "exp"; then \
+			if ! echo "$(LLVM_VERSION_SNAPSHOT)"|grep -q "++"; then \
+				echo "$(DEBIAN_REVISION) contains exp but target unstable"; \
+				exit 1; \
+			fi; \
+		fi; \
+	fi
+
 	@echo "DEB_HOST_MULTIARCH=$(DEB_HOST_MULTIARCH)"
 	@echo "DEB_HOST_GNU_TYPE=$(DEB_HOST_GNU_TYPE)"
 	@echo "DEB_HOST_ARCH_BITS=$(DEB_HOST_ARCH_BITS)"
@@ -447,11 +497,13 @@ preconfigure:
 	@echo "LLVM_VERSION_SNAPSHOT=$(LLVM_VERSION_SNAPSHOT)"
 	@echo "PATH=$(PATH)"
 	@echo "LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)"
+	@echo "LIBCXX_WASM_ENABLE=$(LIBCXX_WASM_ENABLE)"
 
 	for f in debian/*.in; do \
 		f2=$$(echo $$f | sed 's/\.in$$//;s/X\.Y/$(LLVM_VERSION)/'); \
 		echo "$$f => $$f2"; \
 		sed -e 's|@DEB_HOST_MULTIARCH@|$(DEB_HOST_MULTIARCH)|g' \
+			-e "s|@BRANCH_NAME@|$(BRANCH_NAME)|g" \
 			-e "s|@OCAML_STDLIB_DIR@|$(OCAML_STDLIB_DIR)|g" \
 			-e "s|@LLVM_VERSION_FULL@|$(LLVM_VERSION_FULL)|g" \
 			-e "s|@LLVM_VERSION@|$(LLVM_VERSION)|g" $$f > $$f2; \
@@ -461,7 +513,8 @@ preconfigure:
 	chmod +x \
 		debian/clang-tools-$(LLVM_VERSION).install \
 		debian/libclang-$(LLVM_VERSION)-dev.install \
-		debian/libclang-common-$(LLVM_VERSION)-dev.install \
+		debian/libclang-rt-$(LLVM_VERSION)-dev.install \
+		debian/libpolly-$(LLVM_VERSION)-dev.install \
 		debian/libomp-$(LLVM_VERSION)-dev.install \
 		debian/llvm-$(LLVM_VERSION)-dev.install \
 		debian/llvm-$(LLVM_VERSION)-linker-tools.install \
@@ -475,12 +528,25 @@ preconfigure:
 			sed -i -e "s|(<< 1:13.0.0-4)|(<< 1:13.0.0~++20211013044936)|g" debian/control; \
 		fi; \
 	fi
+	# Do the same with the libclang-common move
+	if test "$(LLVM_VERSION)" = "14"; then \
+		if echo "$(LLVM_VERSION_SNAPSHOT)"|grep -q "++"; then \
+			sed -i -e "s|(<< 1:14.0.6-10~exp4)|(<< 1:14.0.6~++20230115063651+f28c006a5895)|g" debian/control; \
+		fi; \
+	fi
 
 	# Conditionally enable *.spv files. Debian buster and Ubuntu 18.04
 	# don't have llvm-spirv to create the *.spv files.
 	if test "$(LLVM_SPIRV_INSTALLED)" = "yes"; then \
 		sed -i -e "s|#spv\ ||g" debian/libclc-$(LLVM_VERSION).install; \
 	fi
+
+	# disable libc++-X.Y-dev-wasm32.install.in on old distro
+	if test "$(LIBCXX_WASM_ENABLE)" = "no"; then \
+		echo "" > debian/libc++-$(LLVM_VERSION)-dev-wasm32.install; \
+		echo "" > debian/libc++abi-$(LLVM_VERSION)-dev-wasm32.install; \
+	fi
+
 	if test "$(DISTRO)" = "stretch"; then \
 		echo "" > debian/python3-lldb-$(LLVM_VERSION).install; \
 	fi
@@ -496,12 +562,13 @@ override_dh_ocamlclean:
 override_dh_ocaml:
 
 override_dh_auto_configure: preconfigure
+ifeq (${SCCACHE_ENABLE},yes)
+	ls -al $(SCCACHE_PATH)*
+endif
 	echo "Using gcc: "
 	$(CC) -v
+	$(CXX) -v
 	mkdir -p $(TARGET_BUILD)
-	mkdir -p clang/include/clang/Debian
-	sed -e "s|@DEB_PATCHSETVERSION@|$(DEBIAN_REVISION)|" \
-		debian/debian_path.h > clang/include/clang/Debian/debian_path.h
 	if test "$(SCAN_BUILD)" = "yes"; then \
 		patch -f -p1 < debian/patches/on-the-fly/use-scan-build-runtimes.diff||true; \
 	fi
@@ -534,7 +601,12 @@ override_dh_auto_configure: preconfigure
 #-    to libc++ when libunwind is built
 #-    Matches what is done on brew:
 #-    https://bit.ly/3kDNpC9
-
+ifeq (${SCCACHE_ENABLE},yes)
+# Just in case...
+	$(SCCACHE_CMD) --stop-server||true
+# Start the sccache server with the right set of options to use GCP
+	SCCACHE_LOG=sccache=debug SCCACHE_ERROR_LOG=$(SCCACHE_PATH)/sccache.log SCCACHE_GCS_KEY_PATH=$(SCCACHE_PATH)/secret-gcp-storage.json SCCACHE_GCS_BUCKET=apt-llvm-org-sccache SCCACHE_GCS_RW_MODE=READ_WRITE $(SCCACHE_CMD) --start-server
+endif
 	echo "Running tests: $(RUN_TEST)"
 	echo "Using cmake: $(CMAKE_BIN)"; \
 	LD_LIBRARY_PATH=$$LD_LIBRARY_PATH \
@@ -560,6 +632,7 @@ override_dh_auto_configure: preconfigure
 	-DLLVM_INCLUDE_GO_TESTS=OFF \
 	-DLLVM_USE_RELATIVE_PATHS_IN_FILES=ON \
 	-DLLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN=ON \
+	-DLLVM_USE_RELATIVE_PATHS_IN_DEBUG_INFO=ON \
 	-DCLANG_PLUGIN_SUPPORT=OFF \
 	-DCLANG_BUILD_EXAMPLES=OFF \
 	-DCLANG_DEFAULT_LINKER=ld \
@@ -652,7 +725,9 @@ ifeq (${LIBFUZZER_ENABLE},yes)
 	cd $(TARGET_BUILD); \
 	CFLAGS="$(opt_flags) $(STAGE_2_CFLAGS)"; \
 	echo $$CFLAGS; \
-	$(STAGE_2_BIN_DIR)/clang++ -c $$CFLAGS -std=c++11 $(BASE_PATH)/compiler-rt/lib/fuzzer/*.cpp -IFuzzer; \
+	for sourcefile in $(BASE_PATH)/compiler-rt/lib/fuzzer/*.cpp; do \
+		$(SCCACHE_CMD) $(STAGE_2_BIN_DIR)/clang++ -c $$CFLAGS -std=c++11 $$sourcefile -IFuzzer; \
+	done; \
 	ar ruv libFuzzer.a Fuzzer*.o
 endif
 	touch $@
@@ -664,6 +739,7 @@ debian-libclc-build:
 	cd libclc/build && \
 	$(CMAKE_BIN) ../ \
 	-G $(GENERATOR) \
+	$(SCCACHE_CMAKE) \
 	-DCMAKE_C_COMPILER=$(STAGE_2_BIN_DIR)/clang \
 	-DCMAKE_CXX_COMPILER=$(STAGE_2_BIN_DIR)/clang++ \
 	-DCMAKE_C_FLAGS="$(opt_flags) $(STAGE_2_CFLAGS)" \
@@ -675,11 +751,149 @@ debian-libclc-build:
 	-DCMAKE_INSTALL_DATADIR=lib \
 	-DCMAKE_INSTALL_INCLUDEDIR=include \
 	-DLLVM_CONFIG=$(STAGE_2_BIN_DIR)/llvm-config \
-	-DLIBCLC_TARGETS_TO_BUILD=$(LIBCLC_TARGETS_TO_BUILD); \
+	-DLIBCLC_TARGETS_TO_BUILD=$(LIBCLC_TARGETS_TO_BUILD) \
+	$(LIBCLC_TARGETS_LLVM_SPIRV); \
 	ninja $(NJOBS) $(VERBOSE)
 	touch $@
 
-override_dh_auto_build: debian-full-build debian-libfuzzer-build debian-libclc-build
+build-wasm/compiler-rt-%: cpu = $(@:build-wasm/compiler-rt-%=%)
+build-wasm/compiler-rt-%:
+	@echo "Building compiler-rt for $(cpu)"
+	@echo "Using cmake: $(CMAKE_BIN)"
+	mkdir -p "$@"
+	$(CMAKE_BIN) -B "$@" -S compiler-rt/lib/builtins/ \
+		-G Ninja \
+		$(SCCACHE_CMAKE) \
+		-DCMAKE_C_COMPILER_TARGET=$(cpu)-unknown-unknown \
+		-DCMAKE_CXX_COMPILER_TARGET=$(cpu)-unknown-unknown \
+		-DCMAKE_ASM_COMPILER_TARGET=$(cpu)-unknown-unknown \
+		-DCMAKE_C_COMPILER=$(STAGE_2_BIN_DIR)/clang \
+		-DCMAKE_CXX_COMPILER=$(STAGE_2_BIN_DIR)/clang++ \
+		-DCMAKE_C_FLAGS="$(opt_flags) $(STAGE_2_CFLAGS)" \
+		-DCMAKE_CXX_FLAGS="$(opt_flags) $(STAGE_2_CXXFLAGS)" \
+		-DCMAKE_SHARED_LINKER_FLAGS="$(STAGE_2_LDFLAGS) -L$(STAGE_2_LIB_DIR)" \
+		-DCMAKE_MODULE_LINKER_FLAGS="$(STAGE_2_LDFLAGS) -L$(STAGE_2_LIB_DIR)" \
+		-DCMAKE_EXE_LINKER_FLAGS="$(STAGE_2_LDFLAGS) -L$(STAGE_2_LIB_DIR)" \
+		-DCMAKE_INSTALL_PREFIX=/usr/lib/llvm-$(LLVM_VERSION)/lib/clang/$(LLVM_VERSION_FULL) \
+		-DCMAKE_INSTALL_DATADIR=lib \
+		-DCMAKE_INSTALL_INCLUDEDIR=include \
+		-DLLVM_CONFIG_PATH=$(STAGE_2_BIN_DIR)/llvm-config \
+		-DCOMPILER_RT_STANDALONE_BUILD=ON \
+		-DCOMPILER_RT_BAREMETAL_BUILD=ON \
+		-DCOMPILER_RT_INCLUDE_TESTS=OFF \
+		-DCOMPILER_RT_USE_LIBCXX=OFF \
+		-DCOMPILER_RT_USE_BUILTINS_LIBRARY=ON \
+		-DCOMPILER_RT_DEFAULT_TARGET_TRIPLE=$(cpu)-unknown-unknown \
+		-DCOMPILER_RT_OS_DIR=wasi
+	ninja -C "$@" $(NJOBS) $(VERBOSE)
+
+ifeq ($(LIBCXX_WASM_ENABLE), no)
+build-wasm/libcxx-%-wasi: build-wasm/compiler-rt-%
+	@echo "Skipping libcxx-*-wasi on this distro $(DISTRO)"
+else
+build-wasm/libcxx-%-wasi: cpu = $(@:build-wasm/libcxx-%-wasi=%)
+build-wasm/libcxx-%-wasi: build-wasm/compiler-rt-%
+	@echo "Building libcxx for $(cpu)"
+	@echo "Using cmake: $(CMAKE_BIN)"
+
+	# We need a functioning clang, which in turn requires a linker. We
+	# patch clang to use a versioned wasm-ld (cf. wasm-ld-path.diff), so
+	# create wasm-ld-$(LLVM_VERSION) in the stage2 bin dir manually.
+	cp $(STAGE_2_BIN_DIR)/wasm-ld $(STAGE_2_BIN_DIR)/wasm-ld-$(LLVM_VERSION)
+
+	# We need a wasm compiler-rt. Depend on the make target that builds it,
+	# and manually copy it to the stage2 lib dir from there
+	mkdir -p \
+	   $(STAGE_2_LIB_DIR)/clang/$(LLVM_VERSION_FULL)/lib/wasi/
+	cp build-wasm/compiler-rt-$(cpu)/lib/wasi/libclang_rt.builtins-$(cpu).a \
+	   $(STAGE_2_LIB_DIR)/clang/$(LLVM_VERSION_FULL)/lib/wasi/
+
+	# Notes:
+	# - Uses $(LDFLAGS) instead of $(STAGE_2_LDFLAGS), because wasm-ld does not
+	#   support --build-id yet. Upstream is working on it, cf. D107662.
+	# - Pass -fno-stack-protector to disable -fstack-protector-strong that is
+	#   passed by default, as this is not supported yet in WebAssembly, cf.
+	#   https://github.com/WebAssembly/wasi-libc/issues/157
+	# - Use llvm-ar and llvm-ranlib, as binutils does not currently support
+	#   WebAssembly and creates invalid indexes.
+	# - Use LLVM_LIBDIR_SUFFIX to install to /usr/lib/wasm32-wasi. To be
+	#   replaced by CMAKE_INSTALL_LIBDIR=lib/$(cpu)-wasi when D130586
+	#   ships.
+	mkdir -p "$@"
+	$(CMAKE_BIN) -B "$@" -S runtimes \
+		-G $(GENERATOR) \
+		$(SCCACHE_CMAKE) \
+		-DCMAKE_C_COMPILER_WORKS=ON \
+		-DCMAKE_CXX_COMPILER_WORKS=ON \
+		-DLLVM_COMPILER_CHECKED=ON \
+		-DCMAKE_C_COMPILER_TARGET=$(cpu)-unknown-wasi \
+		-DCMAKE_CXX_COMPILER_TARGET=$(cpu)-unknown-wasi \
+		-DCMAKE_ASM_COMPILER_TARGET=$(cpu)-unknown-wasi \
+		-DCMAKE_C_COMPILER=$(STAGE_2_BIN_DIR)/clang \
+		-DCMAKE_CXX_COMPILER=$(STAGE_2_BIN_DIR)/clang++ \
+		-DCMAKE_AR=$(STAGE_2_BIN_DIR)/llvm-ar \
+		-DCMAKE_RANLIB=$(STAGE_2_BIN_DIR)/llvm-ranlib \
+		-DCMAKE_C_FLAGS="$(opt_flags) $(STAGE_2_CFLAGS) -fno-stack-protector" \
+		-DCMAKE_CXX_FLAGS="$(opt_flags) $(STAGE_2_CXXFLAGS) -fno-stack-protector" \
+		-DCMAKE_SHARED_LINKER_FLAGS="$(LDFLAGS) -L$(STAGE_2_LIB_DIR)" \
+		-DCMAKE_MODULE_LINKER_FLAGS="$(LDFLAGS) -L$(STAGE_2_LIB_DIR)" \
+		-DCMAKE_EXE_LINKER_FLAGS="$(LDFLAGS) -L$(STAGE_2_LIB_DIR)" \
+		-DCMAKE_INSTALL_PREFIX=/usr/lib/llvm-$(LLVM_VERSION) \
+		-DCMAKE_INSTALL_INCLUDEDIR=include/$(cpu)-wasi \
+		-DLLVM_LIBDIR_SUFFIX=/$(cpu)-wasi \
+		-DLLVM_CONFIG=$(STAGE_2_BIN_DIR)/llvm-config \
+		-DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+		-DLIBCXX_USE_COMPILER_RT=ON \
+		-DLIBCXXABI_USE_COMPILER_RT=ON \
+		-DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
+		-DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
+		-DLIBCXX_STATICALLY_LINK_ABI_IN_SHARED_LIBRARY=OFF \
+		-DCMAKE_BUILD_TYPE=RelWithDebugInfo \
+		-DLIBCXX_CXX_ABI=libcxxabi \
+		-DLIBCXX_ABI_VERSION=2 \
+		-DLIBCXX_HAS_MUSL_LIBC:BOOL=ON \
+		-DLIBCXX_ENABLE_SHARED:BOOL=OFF \
+		-DLIBCXX_ENABLE_EXPERIMENTAL_LIBRARY:BOOL=OFF \
+		-DLIBCXX_ENABLE_EXCEPTIONS:BOOL=OFF \
+		-DLIBCXX_ENABLE_FILESYSTEM:BOOL=OFF \
+		-DLIBCXX_ENABLE_THREADS:BOOL=OFF \
+		-DLIBCXX_HAS_PTHREAD_API:BOOL=OFF \
+		-DLIBCXX_HAS_EXTERNAL_THREAD_API:BOOL=OFF \
+		-DLIBCXX_BUILD_EXTERNAL_THREAD_LIBRARY:BOOL=OFF \
+		-DLIBCXXABI_ENABLE_SHARED:BOOL=OFF \
+		-DLIBCXXABI_ENABLE_EXCEPTIONS:BOOL=OFF \
+		-DLIBCXXABI_SILENT_TERMINATE:BOOL=ON \
+		-DLIBCXXABI_ENABLE_THREADS:BOOL=OFF \
+		-DLIBCXXABI_HAS_PTHREAD_API:BOOL=OFF \
+		-DLIBCXXABI_HAS_EXTERNAL_THREAD_API:BOOL=OFF \
+		-DLIBCXXABI_BUILD_EXTERNAL_THREAD_LIBRARY:BOOL=OFF
+	ninja -C "$@" $(NJOBS) $(VERBOSE)
+endif
+
+# Build compiler-rt for wasm32 and wasm64. Build libcxx only for wasm32, as
+# libcxx requires wasi-libc, which only exists for wasm32 right now.
+debian-wasm-build: \
+  build-wasm/compiler-rt-wasm32 \
+  build-wasm/libcxx-wasm32-wasi \
+  build-wasm/compiler-rt-wasm64
+	touch $@
+
+sccache-stats:
+# If we used sccache, shows stats
+	if test -f $(SCCACHE_CMD); then \
+		ls -al $(SCCACHE_PATH)/; \
+		mkdir -p /tmp/buildd/source/; \
+		$(SCCACHE_CMD) --stats-format json --show-stats > /tmp/buildd/source/sccache-stats.json; \
+		cat /tmp/buildd/source/sccache-stats.json; \
+	fi
+	touch $@
+
+override_dh_auto_build: \
+  debian-full-build \
+  debian-libfuzzer-build \
+  debian-libclc-build \
+  debian-wasm-build \
+  sccache-stats
 
 override_dh_prep: build_doc
 	dh_prep
@@ -740,6 +954,7 @@ endif
 		cd openmp/runtime && doxygen doc/doxygen/config; cd -; \
 		cd openmp/runtime/doc/doxygen/generated/html/ && rm jquery.js && ln -s /usr/share/javascript/jquery/jquery.js; \
 	fi
+	touch $@
 
 override_dh_auto_install:
 	# Clean up temporary files to make sure the install works
@@ -761,6 +976,10 @@ override_dh_auto_install:
 
 	# Only run on executable, not script
 	chrpath -d `find $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/bin/ -type f -executable -exec file -i '{}' \; | grep 'x-executable; charset=binary'|cut -d: -f1`
+	# To fix custom-library-search-path
+ifeq (,$(filter $(DEB_HOST_ARCH_OS),hurd))
+	chrpath -d $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/clang/$(LLVM_VERSION)*/lib/*/*.so
+endif
 
 	: # libclang
 	cd debian/tmp/usr/lib/llvm-$(LLVM_VERSION)/lib/ && \
@@ -819,6 +1038,13 @@ endif
 
 	DESTDIR=$(DEB_INST) ninja $(VERBOSE) -C libclc/build install
 
+	DESTDIR=$(DEB_INST) ninja $(VERBOSE) -C build-wasm/compiler-rt-wasm32 install
+	DESTDIR=$(DEB_INST) ninja $(VERBOSE) -C build-wasm/compiler-rt-wasm64 install
+	if test -d build-wasm/libcxx-wasm32-wasi; then \
+		DESTDIR=$(DEB_INST) ninja $(VERBOSE) -C build-wasm/libcxx-wasm32-wasi install; \
+	fi
+
+
 # Rename binaries
 	mkdir -p $(DEB_INST)/usr/bin/
 	cd $(DEB_INST)/usr/bin/; \
@@ -864,6 +1090,11 @@ endif
 # Also disable mlir-* checks in the cmake
 	sed -i '/_IMPORT_CHECK_TARGETS \(mlir-\|MLIR\)/ {s|^|#|}' $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/llvm/LLVMExports-*.cmake
 
+	sed -i '/_cmake_import_check_files_for_.*\/bin\/.*/ {s|^|#|}'  $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/llvm/LLVMExports-*.cmake $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/clang/ClangTargets-*.cmake
+	sed -i '/_IMPORT_CHECK_FILES_FOR_.*\/bin\/.*/ {s|^|#|}'  $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/llvm/LLVMExports-*.cmake $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/clang/ClangTargets-*.cmake
+	sed -i '/_IMPORT_CHECK_FILES_FOR_\(mlir-\|Polly\|MLIR\)/ {s|^|#|}' $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/llvm/LLVMExports-*.cmake $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/clang/ClangTargets-*.cmake
+	sed -i '/_cmake_import_check_files_for_\(mlir\|Polly\|MLIR\)/ {s|^|#|}' $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/llvm/LLVMExports-*.cmake $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/clang/ClangTargets-*.cmake
+
 # Disable CMake's package validation checks for binaries that may not be installed
 	sed -i 's|.*_IMPORT_CHECK_FILES_FOR_.*/bin/.*)|#&|' $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/clang/ClangTargets-*.cmake
 
@@ -875,12 +1106,12 @@ endif
 
 # Manage the polly files. Sometimes, we build them. Sometimes not.
 	if test "$(POLLY_ENABLE)" = yes; then \
-		mkdir -p $(CURDIR)/debian/libclang-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/lib/ $(CURDIR)/debian/libclang-common-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/polly/; \
+		mkdir -p $(CURDIR)/debian/libclang-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/lib/ $(CURDIR)/debian/libpolly-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/polly/; \
 		mv -f $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/libPolly* \
-		$(CURDIR)/debian/libclang-common-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/lib/; \
-		rm -rf $(CURDIR)/debian/libclang-common-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/polly; \
+		$(CURDIR)/debian/libpolly-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/lib/; \
+		rm -rf $(CURDIR)/debian/libpolly-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/polly; \
 		mv -f $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/include/polly/ \
-		$(CURDIR)/debian/libclang-common-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/; \
+		$(CURDIR)/debian/libpolly-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/; \
 	fi
 
 	mkdir -p $(CURDIR)/debian/usr/share/doc/llvm-$(LLVM_VERSION)-doc/ $(CURDIR)/debian/usr/share/doc/clang-$(LLVM_VERSION)-doc/
@@ -911,6 +1142,7 @@ endif
 # Delete the target build directory to save some space on the build systems
 # All the files have been installed in $(CURDIR)/debian/tmp/ already
 	rm -rf $(TARGET_BUILD)
+	touch $@
 
 
 override_dh_makeshlibs:
@@ -964,14 +1196,16 @@ ifeq ($(shell dpkg --compare-versions $(shell dpkg-query -W -f '$${Version}' bin
 	: # for some reasons, the +x might be removed
 	chmod -f +x $(CURDIR)/debian/*/usr/lib/llvm-$(LLVM_VERSION)/bin/* || true
 else
-	dh_strip -a -v
+	# GNU strip doesn't recognize WebAssembly binaries, and actually corrupts them.
+	# llvm-strip (as of 15.0.2) fails with --strip-debug (but works with --strip-all)
+	dh_strip -a -v -Xlibclang_rt.builtins-wasm32.a -Xlibclang_rt.builtins-wasm64.a -Xusr/lib/wasm32-wasi
 endif
 
 override_dh_install:
 ifeq (${POLLY_ENABLE},yes)
 # only for arch:any builds
-ifneq (,$(filter libclang-common-$(LLVM_VERSION)-dev, $(shell dh_listpackages)))
-	dh_install -p libclang-common-$(LLVM_VERSION)-dev usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/polly/*.cmake usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/polly
+ifneq (,$(filter libpolly-$(LLVM_VERSION)-dev, $(shell dh_listpackages)))
+	dh_install -p libpolly-$(LLVM_VERSION)-dev usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/polly/*.cmake usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/polly
 # On old Debian & Ubuntu, removing the files is necessary
 	rm -rf debian/tmp/usr/lib/llvm-$(LLVM_VERSION)/lib/cmake/polly/*.cmake
 else
@@ -979,6 +1213,18 @@ else
 endif
 endif
 	dh_install --fail-missing
+# Move the libc++ abi files from libc++ to libc++-abi for the wasm32 packages
+# These packages are arch: all, so only do so when the packages are built
+ifneq (,$(filter libc++-$(LLVM_VERSION)-dev-wasm32, $(shell dh_listpackages)))
+	mkdir -p $(CURDIR)/debian/libc++abi-$(LLVM_VERSION)-dev-wasm32/usr/lib/llvm-$(LLVM_VERSION)/include/wasm32-wasi/c++/v1
+	if test -f $(CURDIR)/debian/libc++-$(LLVM_VERSION)-dev-wasm32/usr/lib/llvm-$(LLVM_VERSION)/include/wasm32-wasi/c++/v1/__cxxabi_config.h; then \
+		mv $(CURDIR)/debian/libc++-$(LLVM_VERSION)-dev-wasm32/usr/lib/llvm-$(LLVM_VERSION)/include/wasm32-wasi/c++/v1/__cxxabi_config.h \
+			$(CURDIR)/debian/libc++abi-$(LLVM_VERSION)-dev-wasm32/usr/lib/llvm-$(LLVM_VERSION)/include/wasm32-wasi/c++/v1/__cxxabi_config.h; \
+		mv $(CURDIR)/debian/libc++-$(LLVM_VERSION)-dev-wasm32/usr/lib/llvm-$(LLVM_VERSION)/include/wasm32-wasi/c++/v1/cxxabi.h \
+			$(CURDIR)/debian/libc++abi-$(LLVM_VERSION)-dev-wasm32/usr/lib/llvm-$(LLVM_VERSION)/include/wasm32-wasi/c++/v1/cxxabi.h; \
+	fi
+endif
+
 
 override_dh_installdeb:
 # Managed by the package
@@ -994,6 +1240,7 @@ override_dh_installdeb:
 
 # Remove some libc++ abi files in the libc++ file. See bug #969274
 	rm -f $(CURDIR)/debian/libc++-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/c++/__cxxabi_config.h $(CURDIR)/debian/libc++-$(LLVM_VERSION)-dev/usr/lib/llvm-$(LLVM_VERSION)/include/c++/cxxabi.h
+
 # Remove auto generated python pyc
 	find $(CURDIR)/debian/llvm-$(LLVM_VERSION)-tools/usr/lib/llvm-$(LLVM_VERSION)/ -name '*.pyc' | xargs -r rm -f
 
@@ -1032,7 +1279,11 @@ endif
 	ninja $(VERBOSE) -C $(TARGET_BUILD_STAGE2) check-libcxxabi || true
 
 # MLIR
+ifeq (,$(filter $(DEB_HOST_ARCH), i386 x32))
+# Do not run MLIR test on i386 because of
+# https://github.com/llvm/llvm-project/issues/58357
 	ninja $(VERBOSE) -C $(TARGET_BUILD_STAGE2) check-mlir || true
+endif
 
 # Libclc
 	ninja $(VERBOSE) -C libclc/build test || true
@@ -1078,32 +1329,31 @@ override_dh_auto_test:
 endif
 
 
-override_dh_gencontrol:
+override_dh_gencontrol: sccache-stats
 	dh_gencontrol -- $(control_vars)
 
 
 override_dh_auto_clean:
-	rm -rf $(TARGET_BUILD) tools/clang/include/clang/Debian/debian_path.h llvm/docs/_build/ clang/docs/_build tools/clang/docs/_html/
+	rm -rf $(TARGET_BUILD) llvm/docs/_build/ clang/docs/_build tools/clang/docs/_html/
 # QA tools
 	rm -rf cov-int/ reports/
-	rm -f `ls debian/*.in|sed -e "s|.in$$||g"`
+	rm -f `ls debian/*.in|grep -v control.in|sed -e "s|.in$$||g"`
 	find utils -name '*.pyc' | xargs -r rm -f
 	# Use -I because a test has a space in its name
 	find lldb/test -iname '*.pyc' | xargs -I{} -r rm -f {}
-	find test -name '*.pyc' -o -name '*.cm[ix]' | xargs -r rm -f
-	find test/Bindings -name '*.o' | xargs -r rm -f
-	rm -f tools/clang tools/polly tools/lld tools/lldb projects/compiler-rt
-	rm -rf tools/clang/tools/extra clang/tools/extra/
 	rm -f $(CURDIR)/utils/vim/llvm-$(LLVM_VERSION).vim $(CURDIR)/utils/vim/tablegen-$(LLVM_VERSION).vim
 	rm -f $(CURDIR)/clang/tools/clang-format/clang-format-diff-$(LLVM_VERSION)
 	rm -f $(CURDIR)/clang/tools/clang-format/clang-format-$(LLVM_VERSION).py
 	rm -rf libclc/build
+	rm -rf build-wasm
 	if test -f lld/docs/ld.lld-$(LLVM_VERSION).1; then \
 		mv lld/docs/ld.lld-$(LLVM_VERSION).1 lld/docs/ld.lld.1; \
 	fi
 	for f in debian/*.in; do \
-		f2=$$(echo $$f | sed 's/\.in$$//;s/X\.Y/$(LLVM_VERSION)/'); \
-		rm -f $$f2; \
+		if ! echo $$f|grep control; then \
+			f2=$$(echo $$f | sed 's/\.in$$//;s/X\.Y/$(LLVM_VERSION)/'); \
+			rm -f $$f2; \
+		fi; \
 	done
 	if test "$(SCAN_BUILD)" = "yes"; then \
 		patch -f -R -p1 < debian/patches/on-the-fly/use-scan-build-runtimes.diff||true; \
@@ -1111,6 +1361,6 @@ override_dh_auto_clean:
 	: # for some reason, the docs are written to debian/usr and debian/man ...
 	rm -rf debian/usr debian/man
 	: # remove extra stamps
-	rm -f debian-*-build
+	rm -f debian-*-build override_dh_auto_install sccache-stats build_doc
 
-.PHONY: override_dh_strip preconfigure debian-full-build debian-libfuzzer-build debian-libclc-build
+.PHONY: override_dh_strip preconfigure
