@@ -164,3 +164,7 @@ basic_string.patch
 link-grpc.diff
 libcxx-D124227-wasm.patch
 libclang-cpp-test-link-failure.patch
+
+add-loong64-support.patch
+llvm-14.0.5-add-loongarch-support.patch
+#libunwind-loong64.patch

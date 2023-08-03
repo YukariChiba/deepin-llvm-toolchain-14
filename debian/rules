@@ -288,7 +288,7 @@ endif
 
 # Enable libunwind (or not)
 LIBUNWIND_ENABLE=yes
-ifneq (,$(filter $(DEB_HOST_ARCH), s390x armel m68k mipsel hurd-i386 powerpc sparc sparc64 x32))
+ifneq (,$(filter $(DEB_HOST_ARCH), s390x armel m68k mipsel hurd-i386 powerpc sparc sparc64 x32 loong64))
   LIBUNWIND_ENABLE=no
 # do not use compiler-rt builtins for libcxx (libcxxabi) when libunwind is
 # disabled since the gnu implementation in libgcc_s will then be required
@@ -300,7 +300,7 @@ endif
 
 # Enable openmp (or not)
 OPENMP_ENABLE=yes
-ifneq (,$(filter $(DEB_HOST_ARCH), m68k mipsel powerpc powerpcspe sparc64 s390x x32))
+ifneq (,$(filter $(DEB_HOST_ARCH), m68k mipsel powerpc powerpcspe sparc64 s390x x32 loong64))
   OPENMP_ENABLE=no
 else
   RUNTIMES+=;openmp
@@ -364,7 +364,7 @@ else
 endif
 
 LLDB_ENABLE=yes
-LLDB_DISABLE_ARCHS := hurd-i386 ia64 powerpc powerpcspe ppc64 riscv64 sparc64 mips64el mipsel
+LLDB_DISABLE_ARCHS := hurd-i386 ia64 powerpc powerpcspe ppc64 riscv64 sparc64 mips64el mipsel loong64
 # hurd has threading issues
 ifeq (,$(filter-out $(LLDB_DISABLE_ARCHS), $(DEB_HOST_ARCH)))
 # Disable LLDB for this arch.
@@ -390,6 +390,12 @@ endif
 
 
 LLD_ENABLE=yes
+LLD_DISABLE_ARCHS := loong64
+
+ifeq (,$(filter-out $(LLDB_DISABLE_ARCHS), $(DEB_HOST_ARCH)))
+# Disable LLD for this arch.
+        LLD_ENABLE=no
+endif
 
 ifneq (,$(filter $(DEB_HOST_ARCH_OS),linux))
 # only for linux
@@ -950,10 +956,10 @@ endif
 		echo "Generating manpage of $$f"; \
 		LD_LIBRARY_PATH=$(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/:/usr/lib/*/libfakeroot help2man --no-info --version-string=$(LLVM_VERSION) $(TARGET_BUILD_STAGE2)/bin/$$f > debian/man/$$f-$(LLVM_VERSION).1 || true; \
 	done
-	if test "$(OPENMP_ENABLE)" = yes; then \
+	#if test "$(OPENMP_ENABLE)" = yes; then \
 		cd openmp/runtime && doxygen doc/doxygen/config; cd -; \
 		cd openmp/runtime/doc/doxygen/generated/html/ && rm jquery.js && ln -s /usr/share/javascript/jquery/jquery.js; \
-	fi
+	#fi
 	touch $@
 
 override_dh_auto_install:
@@ -978,7 +984,7 @@ override_dh_auto_install:
 	chrpath -d `find $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/bin/ -type f -executable -exec file -i '{}' \; | grep 'x-executable; charset=binary'|cut -d: -f1`
 	# To fix custom-library-search-path
 ifeq (,$(filter $(DEB_HOST_ARCH_OS),hurd))
-	chrpath -d $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/clang/$(LLVM_VERSION)*/lib/*/*.so
+	chrpath -d $(DEB_INST)/usr/lib/llvm-$(LLVM_VERSION)/lib/clang/$(LLVM_VERSION)*/lib/*/*.so || true
 endif
 
 	: # libclang
